@@ -3,10 +3,11 @@ package main
 import (
 	"log"
 	"net"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 )
-
-var wg sync.WaitGroup
 
 // 0-15的报文类型值
 const (
@@ -82,12 +83,14 @@ type Conn struct {
 	conn   net.Conn
 	maxBuf int
 	close  sync.Once
+	exit   chan struct{}
 }
 
 func newConn(c net.Conn) *Conn {
 	return &Conn{
 		maxBuf: 10240,
 		conn:   c,
+		exit:   make(chan struct{}, 1), // 设置为1、防止阻塞
 	}
 }
 
@@ -98,15 +101,21 @@ func (c *Conn) Read() {
 			log.Println("exit-read")
 		}()
 		for {
-			buf := make([]byte, c.maxBuf)
-			i, err := c.conn.Read(buf)
-			if err != nil && err.Error() != "EOF" {
-				log.Println("err", err)
-				c.Close()
+			select {
+			case <-c.exit:
+				log.Println("关闭读协程")
 				return
-			}
-			if i > 0 {
-				c.Decode(buf[:i])
+			default:
+				buf := make([]byte, c.maxBuf)
+				i, err := c.conn.Read(buf)
+				if err != nil && err.Error() != "EOF" {
+					log.Println("err", err)
+					c.Close()
+					return
+				}
+				if i > 0 {
+					c.Decode(buf[:i])
+				}
 			}
 		}
 	}()
@@ -142,11 +151,13 @@ func (c *Conn) Decode(buf []byte) {
 // Close 关闭服务
 func (c *Conn) Close() {
 	c.close.Do(func() {
+		log.Println("关闭服务连接")
 		err := c.conn.Close()
 		if err != nil {
 			log.Println("err", err)
 			return
 		}
+		c.exit <- struct{}{}
 	})
 
 }
@@ -193,6 +204,7 @@ func (c *Conn) parseType(t byte) {
 	return
 }
 
+// 开启监听
 func listen(l net.Listener) {
 	go func() {
 		defer func() {
@@ -215,13 +227,18 @@ func main() {
 	log.Println("Listing in port 1883")
 	defer func() {
 		log.Println("exit-main")
+		if r := recover(); r != nil {
+			log.Println("err", r)
+		}
 	}()
-	wg.Add(1)
 	lister, err := net.Listen("tcp", ":1883")
 	if err != nil {
 		log.Println("lister-error", err)
 		return
 	}
 	listen(lister)
-	wg.Wait()
+	exitChan := make(chan os.Signal, 1)
+	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-exitChan
+	log.Println("service received signal:", sig.String())
 }
